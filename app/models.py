@@ -37,3 +37,4 @@ class ServerStatus(BaseModel):
     max_streams: int
     channels_count: int
     epg_sources: list[str]
+    viewers: int = 0

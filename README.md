@@ -106,13 +106,21 @@ Fritzbox (RTSP + DVB-C Tuner)
 
 ## Konfiguration
 
-`app/config.py`:
+Per Umgebungsvariable (z.B. in `docker-compose.yml` unter `environment:`):
 
-| Variable | Standard | Beschreibung |
-|---|---|---|
-| `MAX_STREAMS` | 4 | Maximale parallele Streams |
-| `STREAM_TIMEOUT` | 15 | Sekunden ohne Client → Stream wird beendet |
-| `EPG_FETCH_INTERVAL` | 3600 | Background EPG-Refresh in Sekunden |
+| Variable                        | Standard    | Beschreibung                                                        |
+| ------------------------------- | ----------- | ------------------------------------------------------------------- |
+| `FRITZMUX_MAX_STREAMS`          | 4           | Maximale parallele Sender (Tuner der Fritzbox)                      |
+| `FRITZMUX_STREAM_TIMEOUT`       | 15          | Sekunden, die ein Sender nach dem letzten Zuschauer weiterläuft      |
+| `FRITZMUX_STREAM_START_TIMEOUT` | 10          | Sekunden bis zum ersten Bild, sonst Fehler 502                      |
+| `FRITZMUX_RTSP_TRANSPORT`       | udp         | RTSP-Transport zur Fritzbox (TCP lehnt die Box mit 461 ab)          |
+| `FRITZMUX_EPG_INTERVAL`         | 3600        | EPG-Aktualisierung in Sekunden                                      |
+| `FRITZMUX_EPG_KEEP_PAST_HOURS`  | 6           | Wie lange beendete Sendungen im EPG bleiben                         |
+| `FRITZMUX_USER` / `FRITZMUX_PASSWORD` | leer  | Optionaler Passwortschutz (HTTP Basic) für Web UI und Admin-API. Playlist, EPG, Logos und Streams bleiben für Player offen. |
+| `FRITZMUX_DATA_DIR`             | /app/data   | Datenverzeichnis                                                    |
+
+Ein Sender, der gerade niemanden mehr hat, gibt seinen Tuner sofort frei, wenn ein anderer Sender ihn braucht (Zappen).
+Mehrere Geräte können denselben Sender gleichzeitig schauen und teilen sich dabei einen Tuner.
 
 ## Docker
 
