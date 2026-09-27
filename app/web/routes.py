@@ -1,16 +1,14 @@
 import logging
-import mimetypes
+import re
 from pathlib import Path
 
 import httpx
-from fastapi import APIRouter, File, Form, UploadFile, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse, Response, StreamingResponse
+from fastapi import APIRouter, File, Form, Request, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
-from app import m3u_handler
-from app import stream_manager
-from app import epg_manager
-from app.config import DATA_DIR
+from app import epg_manager, m3u_handler, stream_manager
+from app.config import MAX_STREAMS, STREAM_START_TIMEOUT
 from app.models import ChannelUpdate, ImportRequest, ServerStatus
 
 logger = logging.getLogger(__name__)
@@ -23,6 +21,13 @@ _jinja_env = Environment(
     autoescape=select_autoescape(["html", "xml"]),
 )
 
+AVM_LOGO_BASE = "https://download.avm.de/tv/logos/"
+
+
+def err(message: str, status: int = 400, **extra) -> JSONResponse:
+    # FastAPI does not turn "return body, status" tuples into a status code.
+    return JSONResponse({"error": message, **extra}, status_code=status)
+
 
 @router.get("/", response_class=HTMLResponse)
 async def index(request: Request):
@@ -30,7 +35,7 @@ async def index(request: Request):
     html = tpl.render(
         channels=list(m3u_handler.CHANNELS.values()),
         active_streams=stream_manager.active_stream_count(),
-        max_streams=4,
+        max_streams=MAX_STREAMS,
         epg_sources=epg_manager.EPG_SOURCES,
     )
     return HTMLResponse(html)
@@ -40,9 +45,10 @@ async def index(request: Request):
 async def api_status():
     return ServerStatus(
         active_streams=stream_manager.active_stream_count(),
-        max_streams=4,
+        max_streams=MAX_STREAMS,
         channels_count=len(m3u_handler.CHANNELS),
         epg_sources=[s["name"] for s in epg_manager.EPG_SOURCES],
+        viewers=stream_manager.viewer_count(),
     )
 
 
@@ -54,23 +60,19 @@ async def api_channels():
 @router.get("/api/channels.m3u")
 async def api_m3u(request: Request):
     base_url = str(request.base_url).rstrip("/")
-    content = m3u_handler.generate_m3u(base_url)
-    logger.info("M3U generated: %d bytes, starts with: %s", len(content), content[:120].replace("\n", "\\n"))
+    content = m3u_handler.generate_m3u(base_url, epg_url=f"{base_url}/api/epg.xml")
     return Response(
         content=content.encode("utf-8"),
-        media_type="text/plain; charset=utf-8",
-        headers={"Content-Disposition": 'attachment; filename="channels.m3u"'},
+        media_type="audio/x-mpegurl; charset=utf-8",
+        headers={"Content-Disposition": 'inline; filename="channels.m3u"'},
     )
 
 
 @router.get("/api/epg.xml")
-async def api_epg(request: Request):
-    channel_map = {
-        ch.tvg_id: ch.tvg_name for ch in m3u_handler.CHANNELS.values()
-    }
-    xml = epg_manager.generate_xmltv(channel_map)
+async def api_epg():
+    xml = epg_manager.generate_xmltv(m3u_handler.CHANNELS.values())
     return Response(
-        content=xml.encode("utf-8"),
+        content=xml,
         media_type="application/xml; charset=utf-8",
         headers={"Content-Disposition": 'inline; filename="fritzmux.xml"'},
     )
@@ -85,80 +87,95 @@ async def api_epg_channels():
 async def api_epg_refresh():
     await epg_manager.fetch_all()
     icons = epg_manager.get_channel_icons()
+    changed = False
     for ch in m3u_handler.CHANNELS.values():
-        if not ch.tvg_logo and ch.tvg_id in icons:
-            ch.tvg_logo = icons[ch.tvg_id]
-    m3u_handler.save_channels()
-    return {"status": "ok", "events": len(epg_manager.get_epg_data())}
+        epg_id = epg_manager.resolve_epg_id(ch.tvg_id, [ch.tvg_name, ch.title])
+        if not ch.tvg_logo and epg_id in icons:
+            ch.tvg_logo = icons[epg_id]
+            changed = True
+    if changed:
+        m3u_handler.save_channels()
+    return {"status": "ok", "events": epg_manager.programme_count()}
 
 
 @router.post("/api/import/url")
 async def api_import_url(req: ImportRequest):
     if not req.url:
-        return {"error": "URL is required"}, 400
+        return err("URL is required")
     try:
         channels = await m3u_handler.import_from_url(req.url)
         if not channels:
-            return {"status": "ok", "imported": 0, "total": len(m3u_handler.CHANNELS), "warning": "URL enthielt keine gültigen M3U-Einträge. Prüfe die URL oder lade die M3U-Datei manuell hoch."}
+            return {"status": "ok", "imported": 0, "total": len(m3u_handler.CHANNELS),
+                    "warning": "URL enthielt keine gültigen M3U-Einträge. Prüfe die URL oder lade die M3U-Datei manuell hoch."}
         added = m3u_handler.merge_channels(channels, replace=req.replace)
         return {"status": "ok", "imported": added, "total": len(m3u_handler.CHANNELS)}
     except httpx.ConnectError:
-        return {"error": "Fritzbox nicht erreichbar. Prüfe die IP-Adresse."}, 400
+        return err("Fritzbox nicht erreichbar. Prüfe die IP-Adresse.", 502)
     except httpx.TimeoutException:
-        return {"error": "Zeitüberschreitung – Fritzbox antwortet nicht."}, 400
+        return err("Zeitüberschreitung – Fritzbox antwortet nicht.", 504)
     except Exception as e:
         logger.exception("Import failed")
-        return {"error": str(e)}, 400
+        return err(str(e))
 
 
 @router.post("/api/scan/fritzbox")
-async def api_scan_fritzbox(ip: str = Form(...)):
-    base = ip.rstrip("/")
-    urls_to_try = [
-        # Fritzbox DVB-C Senderliste (nach "Senderliste erzeugen" im WebUI)
-        f"http://{base}/dvb/m3u/tvhd.m3u",
-        f"http://{base}/dvb/m3u/tvsd.m3u",
-        f"http://{base}/dvb/m3u/radio.m3u",
-        f"http://{base}/dvb/m3u/tvall.m3u",
-        # TR-064 / UPnP Port
-        f"http://{base}:49000/m3u",
-        f"http://{base}:49000/m3u.m3u",
-        f"http://{base}:49000/tonline.m3u",
-        # Legacy WEBCM
-        f"http://{base}/cgi-bin/webcm?getpage=../html/de/internet/tvapp.m3u",
-        f"http://{base}/internet/tvapp.m3u",
+async def api_scan_fritzbox(ip: str = Form(...), include_radio: bool = Form(False)):
+    base = re.sub(r"^https?://", "", ip.strip()).rstrip("/")
+    # The Fritzbox keeps HD and SD channels in separate lists. Vodafone carries
+    # most unencrypted private channels (RTL, ProSieben, ...) in SD only, so all
+    # lists have to be imported, not just the first one found.
+    lists = [("tvhd.m3u", "HD"), ("tvsd.m3u", "SD"), ("tvall.m3u", "")]
+    if include_radio:
+        lists.append(("radio.m3u", "Radio"))
+    candidates = [(f"http://{base}/dvb/m3u/{name}", group) for name, group in lists]
+    legacy = [
+        (f"http://{base}:49000/m3u", ""),
+        (f"http://{base}:49000/m3u.m3u", ""),
+        (f"http://{base}/cgi-bin/webcm?getpage=../html/de/internet/tvapp.m3u", ""),
+        (f"http://{base}/internet/tvapp.m3u", ""),
     ]
+    found_urls, found_channels = [], []
     async with httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
-        for url in urls_to_try:
-            try:
-                resp = await client.get(url)
-                if resp.status_code == 200:
-                    channels = m3u_handler.parse_m3u(resp.text)
-                    if channels:
-                        added = m3u_handler.merge_channels(channels, replace=False)
-                        return {"status": "ok", "url": url, "imported": added, "total": len(m3u_handler.CHANNELS)}
-                    # URL gefunden, aber kein gültiges M3U
-                    return {"status": "ok", "url": url, "imported": 0}
-            except Exception:
-                continue
-    return {"status": "not_found", "message": "Keine M3U-URL auf der Fritzbox gefunden. Lade die M3U-Datei manuell hoch."}, 404
+        for group_set in (candidates, legacy):
+            for url, group in group_set:
+                try:
+                    text = await m3u_handler.fetch_playlist(client, url)
+                except Exception:
+                    continue
+                channels = m3u_handler.parse_m3u(text, default_group=group)
+                if channels:
+                    found_urls.append(url)
+                    found_channels.extend(channels)
+            if found_channels:
+                break
+    if not found_channels:
+        return err("Keine M3U-Senderliste auf der Fritzbox gefunden. Sendersuchlauf unter DVB-C gemacht? "
+                   "Sonst die M3U-Datei manuell hochladen.", 404, status="not_found")
+    added = m3u_handler.merge_channels(found_channels, replace=False)
+    return {"status": "ok", "url": found_urls[0], "urls": found_urls, "found": len(found_channels),
+            "imported": added, "total": len(m3u_handler.CHANNELS)}
 
 
 @router.post("/api/import/upload")
 async def api_import_upload(file: UploadFile = File(...), replace: bool = Form(False)):
     try:
-        content = await file.read()
-        text = content.decode("utf-8")
+        text = m3u_handler.decode_playlist(await file.read())
         channels = m3u_handler.import_from_text(text)
+        if not channels:
+            return err("Datei enthält keine gültigen M3U-Einträge.")
         added = m3u_handler.merge_channels(channels, replace=replace)
         return {"status": "ok", "imported": added, "total": len(m3u_handler.CHANNELS)}
     except Exception as e:
-        return {"error": str(e)}, 400
+        logger.exception("Upload failed")
+        return err(str(e))
 
 
 @router.post("/api/epg/source")
 async def api_epg_add_source(name: str = Form(...), url: str = Form(...)):
-    epg_manager.add_source(name, url)
+    try:
+        epg_manager.add_source(name, url)
+    except epg_manager.SourceError as e:
+        return err(str(e))
     return {"status": "ok"}
 
 
@@ -177,30 +194,33 @@ async def api_epg_remove_source(name: str):
 async def api_channel_detail(channel_id: str):
     ch = m3u_handler.CHANNELS.get(channel_id)
     if not ch:
-        return {"error": "not found"}, 404
+        return err("not found", 404)
     return ch
 
 
 @router.delete("/api/channels/{channel_id}")
 async def api_channel_delete(channel_id: str):
-    if channel_id in m3u_handler.CHANNELS:
-        del m3u_handler.CHANNELS[channel_id]
-        m3u_handler.save_channels()
+    m3u_handler.delete_channel(channel_id)
     return {"status": "ok"}
 
 
 @router.put("/api/channels/{channel_id}")
 async def api_channel_update(channel_id: str, update: ChannelUpdate):
-    ch = m3u_handler.update_channel(channel_id, update.model_dump(exclude_none=True))
+    data = update.model_dump(exclude_none=True)
+    if "rtsp_url" in data and not data["rtsp_url"].startswith(m3u_handler.ALLOWED_STREAM_SCHEMES):
+        return err("Stream-URL muss mit rtsp://, http:// oder https:// beginnen")
+    if data.get("tvg_logo") and data["tvg_logo"] != "__uploaded__" \
+            and not data["tvg_logo"].startswith(("http://", "https://")):
+        return err("Logo-URL muss mit http:// oder https:// beginnen")
+    ch = m3u_handler.update_channel(channel_id, data)
     if not ch:
-        return {"error": "not found"}, 404
+        return err("not found", 404)
     return ch
 
 
 @router.post("/api/channels/clear")
 async def api_channels_clear():
-    m3u_handler.CHANNELS.clear()
-    m3u_handler.save_channels()
+    m3u_handler.clear_channels()
     return {"status": "ok"}
 
 
@@ -210,31 +230,24 @@ async def api_logo(channel_id: str):
     if not ch or not ch.tvg_logo:
         return Response(status_code=404, content="No logo")
 
-    logo_dir = DATA_DIR / "logos"
-    logo_dir.mkdir(parents=True, exist_ok=True)
-    cache_file = logo_dir / f"{channel_id}"
-    meta_file = logo_dir / f"{channel_id}.meta"
-
-    # Serve uploaded logo
-    if ch.tvg_logo == "__uploaded__":
-        if cache_file.exists() and meta_file.exists():
-            media_type = meta_file.read_text().strip()
-            return Response(content=cache_file.read_bytes(), media_type=media_type)
-        return Response(status_code=404, content="Uploaded logo not found")
-
+    cache_file, meta_file = m3u_handler.logo_paths(channel_id)
+    headers = {"Cache-Control": "public, max-age=86400"}
     if cache_file.exists() and meta_file.exists():
         media_type = meta_file.read_text().strip()
-        return Response(content=cache_file.read_bytes(), media_type=media_type)
+        return Response(content=cache_file.read_bytes(), media_type=media_type, headers=headers)
+    if ch.tvg_logo == "__uploaded__":
+        return Response(status_code=404, content="Uploaded logo not found")
 
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
             resp = await client.get(ch.tvg_logo)
             resp.raise_for_status()
-            data = resp.content
-            media_type = resp.headers.get("content-type", "image/png")
-            cache_file.write_bytes(data)
-            meta_file.write_text(media_type)
-            return Response(content=data, media_type=media_type)
+        media_type = resp.headers.get("content-type", "image/png").split(";")[0]
+        if not media_type.startswith("image/"):
+            return Response(status_code=502, content="Logo URL did not return an image")
+        cache_file.write_bytes(resp.content)
+        meta_file.write_text(media_type)
+        return Response(content=resp.content, media_type=media_type, headers=headers)
     except Exception as e:
         logger.warning("Failed to fetch logo for %s: %s", channel_id, e)
         return Response(status_code=502, content="Logo fetch failed")
@@ -244,97 +257,84 @@ async def api_logo(channel_id: str):
 async def api_logo_upload(channel_id: str, file: UploadFile = File(...)):
     ch = m3u_handler.CHANNELS.get(channel_id)
     if not ch:
-        return {"error": "not found"}, 404
-
-    logo_dir = DATA_DIR / "logos"
-    logo_dir.mkdir(parents=True, exist_ok=True)
-    cache_file = logo_dir / f"{channel_id}"
-    meta_file = logo_dir / f"{channel_id}.meta"
-
-    data = await file.read()
+        return err("not found", 404)
     media_type = file.content_type or "image/png"
-    cache_file.write_bytes(data)
+    if not media_type.startswith("image/"):
+        return err("Nur Bilddateien")
+    cache_file, meta_file = m3u_handler.logo_paths(channel_id)
+    cache_file.write_bytes(await file.read())
     meta_file.write_text(media_type)
-
     ch.tvg_logo = "__uploaded__"
     m3u_handler.save_channels()
     return {"status": "ok", "logo": f"/api/logo/{channel_id}"}
 
 
+def _normalize_logo_name(name: str) -> str:
+    n = name.lower().strip()
+    n = n.replace("ü", "ue").replace("ö", "oe").replace("ä", "ae").replace("ß", "ss")
+    n = re.sub(r"[^a-z0-9]+", "_", n).strip("_")
+    for suffix in ("_hd", "_sd", "_de"):
+        if n.endswith(suffix):
+            n = n[:-len(suffix)]
+    return n
+
+
 @router.post("/api/logos/avm")
 async def api_fetch_avm_logos():
-    AVM_BASE = "https://download.avm.de/tv/logos/"
-    logo_dir = DATA_DIR / "logos"
-    logo_dir.mkdir(parents=True, exist_ok=True)
-
-    # Hole verfügbare Logos von AVM
     try:
         async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-            resp = await client.get(AVM_BASE)
+            resp = await client.get(AVM_LOGO_BASE)
             resp.raise_for_status()
-            import re
-            avm_logos = set(re.findall(r'href="([^"]+\.png)"', resp.text))
+            avm_logos = set(re.findall(r'href="([^"/]+\.png)"', resp.text))
     except Exception as e:
-        return {"error": f"AVM-Repository nicht erreichbar: {e}"}, 502
+        return err(f"AVM-Repository nicht erreichbar: {e}", 502)
 
     if not avm_logos:
-        return {"error": "Keine Logos im AVM-Repository gefunden"}, 404
+        return err("Keine Logos im AVM-Repository gefunden", 404)
 
-    def normalize(name: str) -> str:
-        n = name.lower().strip()
-        n = n.replace("ü", "ue").replace("ö", "oe").replace("ä", "ae").replace("ß", "ss")
-        n = re.sub(r"[^a-z0-9]+", "_", n).strip("_")
-        # Entferne häufige Suffixe
-        for suffix in ["_hd", "_sd", "_de"]:
-            if n.endswith(suffix):
-                n = n[:-len(suffix)]
-        return n
-
-    # Baue Mapping: normalized_name -> original filename
     logo_map = {}
     for fn in avm_logos:
-        base = fn.replace(".png", "")
-        # auch mit _hd, _sd versionen
-        logo_map[base] = fn
-        for suffix in ["_hd", "_sd"]:
+        base = fn[:-4]
+        logo_map.setdefault(base, fn)
+        for suffix in ("_hd", "_sd"):
             if base.endswith(suffix):
-                logo_map[base[:-len(suffix)]] = fn
+                logo_map.setdefault(base[:-len(suffix)], fn)
 
     found = 0
     async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
         for ch in m3u_handler.CHANNELS.values():
-            for name_candidate in [ch.tvg_name, ch.title, ch.tvg_id]:
-                if not name_candidate:
+            cache_file, meta_file = m3u_handler.logo_paths(ch.id)
+            if ch.tvg_logo == "__uploaded__" and cache_file.exists():
+                continue  # keep logos the user uploaded or that were already fetched
+            for candidate in (ch.tvg_name, ch.title, ch.tvg_id):
+                if not candidate:
                     continue
-                norm = normalize(name_candidate)
-                fn = logo_map.get(norm)
+                norm = _normalize_logo_name(candidate)
+                fn = logo_map.get(norm) or logo_map.get(f"{norm}_hd") or logo_map.get(f"{norm}_sd")
                 if not fn:
-                    # Versuche mit _hd suffix
-                    fn = logo_map.get(f"{norm}_hd") or logo_map.get(f"{norm}_sd")
-                if fn:
-                    cache_file = logo_dir / ch.id
-                    meta_file = logo_dir / f"{ch.id}.meta"
-                    if cache_file.exists():
-                        # bereits vorhanden
-                        if ch.tvg_logo != "__uploaded__":
-                            ch.tvg_logo = "__uploaded__"
-                            found += 1
-                        break
-                    try:
-                        url = AVM_BASE + fn
-                        resp = await client.get(url)
-                        resp.raise_for_status()
-                        cache_file.write_bytes(resp.content)
-                        meta_file.write_text(resp.headers.get("content-type", "image/png"))
-                        ch.tvg_logo = "__uploaded__"
-                        found += 1
-                        break
-                    except Exception:
-                        continue
+                    continue
+                try:
+                    resp = await client.get(AVM_LOGO_BASE + fn)
+                    resp.raise_for_status()
+                except Exception:
+                    continue
+                cache_file.write_bytes(resp.content)
+                meta_file.write_text(resp.headers.get("content-type", "image/png").split(";")[0])
+                ch.tvg_logo = "__uploaded__"
+                found += 1
+                break
 
     if found:
         m3u_handler.save_channels()
     return {"status": "ok", "found": found, "total": len(m3u_handler.CHANNELS)}
+
+
+@router.head("/stream/{channel_id}")
+async def stream_channel_head(channel_id: str):
+    # Some players probe with HEAD first; answer without occupying a tuner.
+    if channel_id not in m3u_handler.CHANNELS:
+        return Response(status_code=404)
+    return Response(status_code=200, media_type="video/mp2t")
 
 
 @router.get("/stream/{channel_id}")
@@ -343,93 +343,50 @@ async def stream_channel(channel_id: str):
     if not ch:
         return Response(status_code=404, content="Channel not found")
 
-    if stream_manager.active_stream_count() >= 4:
+    try:
+        stream, queue = await stream_manager.subscribe(channel_id, ch.rtsp_url)
+    except stream_manager.NoTunerFree:
         return Response(status_code=503, content="All tuners busy")
 
-    # Starte ffmpeg und warte auf erste Daten (max 10s)
-    import asyncio
-    process = await stream_manager.start_ffmpeg(ch.rtsp_url, channel_id)
-    if process is None:
-        return Response(status_code=503, content="Stream unavailable")
-
-    first_chunk = None
-    stderr_log = ""
-    for attempt in range(40):  # 40 × 250ms = 10s timeout
-        await asyncio.sleep(0.25)
-        if process.returncode is not None:
-            if process.stderr:
-                try:
-                    err = await asyncio.wait_for(process.stderr.read(), timeout=1)
-                    stderr_log = err.decode("utf-8", errors="replace")[:1000]
-                except Exception:
-                    pass
-            logger.warning("ffmpeg exit %d for %s: %s", process.returncode, channel_id, stderr_log[:200])
-            return Response(status_code=502, content=f"ffmpeg exited with code {process.returncode}: {stderr_log[:200]}")
-        try:
-            assert process.stdout is not None
-            first_chunk = await asyncio.wait_for(process.stdout.read(8192), timeout=0.25)
-            if first_chunk:
-                break
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            continue
-
-    if not first_chunk:
-        await stream_manager.stop_ffmpeg(channel_id)
-        return Response(status_code=502, content="ffmpeg produced no data after 10s")
+    first = await stream_manager.first_chunk(queue, STREAM_START_TIMEOUT)
+    if not first:
+        stream_manager.unsubscribe(stream, queue)
+        detail = stream.last_error or f"no data after {STREAM_START_TIMEOUT}s"
+        logger.warning("Channel %s failed to start: %s", channel_id, detail)
+        return Response(status_code=502, content=f"Stream failed: {detail}")
 
     async def gen():
-        yield first_chunk
         try:
+            yield first
             while True:
-                chunk = await process.stdout.read(8192)
-                if not chunk:
+                chunk = await queue.get()
+                if chunk is None:
                     break
                 yield chunk
-        except (asyncio.CancelledError, GeneratorExit):
-            raise
-        except Exception:
-            logger.exception("Stream error for channel %s", channel_id)
         finally:
-            await stream_manager.stop_ffmpeg(channel_id)
+            stream_manager.unsubscribe(stream, queue)
 
     return StreamingResponse(
         gen(),
-        media_type="video/MP2T",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-        },
+        media_type="video/mp2t",
+        headers={"Cache-Control": "no-cache"},
     )
 
 
 @router.post("/api/stream/test")
 async def api_stream_test(channel_id: str = Form(...)):
+    """Runs the real relay path once and reports whether data arrives."""
     ch = m3u_handler.CHANNELS.get(channel_id)
     if not ch:
-        return {"error": "Channel not found"}
-    import subprocess, sys
-    proc = await asyncio.create_subprocess_exec(
-        "ffmpeg",
-        "-rtsp_transport", "tcp",
-        "-rtsp_flags", "prefer_tcp",
-        "-i", ch.rtsp_url,
-        "-c", "copy",
-        "-f", "null",
-        "-",
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        timeout=10,
-    )
+        return err("Channel not found", 404)
     try:
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
-        rc = proc.returncode
-        err_text = stderr.decode("utf-8", errors="replace")[-1000:]
-        if rc == 0:
-            return {"status": "ok", "message": "ffmpeg connected successfully"}
-        else:
-            return {"status": "error", "message": err_text}
-    except asyncio.TimeoutError:
-        proc.kill()
-        return {"status": "error", "message": "Timeout (10s) – Fritzbox antwortet nicht"}
-    except Exception as e:
-        return {"error": str(e)}
+        stream, queue = await stream_manager.subscribe(channel_id, ch.rtsp_url)
+    except stream_manager.NoTunerFree:
+        return {"status": "error", "message": "Alle Tuner belegt"}
+    try:
+        first = await stream_manager.first_chunk(queue, STREAM_START_TIMEOUT)
+    finally:
+        stream_manager.unsubscribe(stream, queue)
+    if first:
+        return {"status": "ok", "message": "ffmpeg liefert Daten"}
+    return {"status": "error", "message": stream.last_error or "Keine Daten (Timeout)"}

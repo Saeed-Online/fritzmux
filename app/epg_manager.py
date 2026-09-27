@@ -1,92 +1,172 @@
 import asyncio
 import gzip
+import hashlib
 import json
 import logging
-from datetime import datetime, timedelta
-from pathlib import Path
+import re
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
 from typing import Optional
+from xml.sax.saxutils import escape, quoteattr
 
 import httpx
 
-from app.config import EPG_CACHE_DIR, EPG_FETCH_INTERVAL, EPG_SOURCES_FILE
+from app.config import EPG_CACHE_DIR, EPG_KEEP_PAST_HOURS, EPG_SOURCES_FILE
+from app.m3u_handler import _atomic_write
 
 logger = logging.getLogger(__name__)
 
+SOURCE_NAME_RE = re.compile(r"^[\w .-]{1,64}$")
+
 EPG_SOURCES: list[dict] = []
-_epg_data: list[dict] = []
+
+# epg channel id -> display name / icon
+_epg_channels: dict[str, str] = {}
+_channel_icons: dict[str, str] = {}
+# (epg channel id, start attr, stop attr, stop as UTC datetime or None, serialized children)
+_programmes: list[tuple[str, str, str, Optional[datetime], bytes]] = []
+_version = 0
 _last_fetch: Optional[datetime] = None
 _fetch_lock = asyncio.Lock()
+_xml_cache: dict[str, bytes] = {}
+
+
+class SourceError(ValueError):
+    pass
+
+
+# ---------------------------------------------------------------- sources
+
+def _cache_file(name: str):
+    slug = hashlib.sha1(name.encode("utf-8")).hexdigest()[:12]
+    return EPG_CACHE_DIR / f"{slug}.xml"
 
 
 def add_source(name: str, url: str):
+    name = name.strip()
+    url = url.strip()
+    if not SOURCE_NAME_RE.match(name):
+        raise SourceError("Ungültiger Name (erlaubt: Buchstaben, Zahlen, Leerzeichen, . _ -)")
+    if not url.startswith(("http://", "https://")):
+        raise SourceError("Nur http:// oder https:// URLs")
+    if any(s["name"] == name for s in EPG_SOURCES):
+        raise SourceError("Eine Quelle mit diesem Namen existiert bereits")
     EPG_SOURCES.append({"name": name, "url": url, "enabled": True})
     save_sources()
 
 
 def remove_source(name: str):
-    global EPG_SOURCES
-    EPG_SOURCES = [s for s in EPG_SOURCES if s["name"] != name]
+    EPG_SOURCES[:] = [s for s in EPG_SOURCES if s["name"] != name]
+    _cache_file(name).unlink(missing_ok=True)
     save_sources()
 
 
 def save_sources():
-    EPG_SOURCES_FILE.write_text(json.dumps(EPG_SOURCES, indent=2))
+    _atomic_write(EPG_SOURCES_FILE, json.dumps(EPG_SOURCES, indent=2, ensure_ascii=False))
 
 
 def load_sources():
     if EPG_SOURCES_FILE.exists():
-        data = json.loads(EPG_SOURCES_FILE.read_text())
+        data = json.loads(EPG_SOURCES_FILE.read_text(encoding="utf-8"))
         EPG_SOURCES.clear()
         EPG_SOURCES.extend(data)
 
 
-async def fetch_all():
-    global _epg_data, _last_fetch
+# ---------------------------------------------------------------- fetching / parsing
 
+def _maybe_gunzip(data: bytes) -> bytes:
+    # httpx already undoes Content-Encoding; .xml.gz files still arrive compressed.
+    if data[:2] == b"\x1f\x8b":
+        return gzip.decompress(data)
+    return data
+
+
+def _parse_time(value: str) -> Optional[datetime]:
+    value = value.strip()
+    for fmt in ("%Y%m%d%H%M%S %z", "%Y%m%d%H%M%S"):
+        try:
+            dt = datetime.strptime(value, fmt)
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def _parse_file(path) -> tuple[dict, dict, list]:
+    """Runs in a worker thread; streaming parse keeps memory low on a Pi."""
+    channels: dict[str, str] = {}
+    icons: dict[str, str] = {}
+    programmes = []
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=EPG_KEEP_PAST_HOURS)
+    try:
+        for _, el in ET.iterparse(str(path), events=("end",)):
+            if el.tag == "channel":
+                ch_id = el.get("id", "")
+                dn = el.find("display-name")
+                channels[ch_id] = (dn.text or ch_id) if dn is not None else ch_id
+                icon = el.find("icon")
+                if icon is not None and icon.get("src"):
+                    icons[ch_id] = icon.get("src")
+                el.clear()
+            elif el.tag == "programme":
+                stop_raw = el.get("stop", "")
+                stop = _parse_time(stop_raw)
+                if stop is None or stop >= cutoff:
+                    body = "".join(ET.tostring(child, encoding="unicode") for child in el).encode("utf-8")
+                    programmes.append((el.get("channel", ""), el.get("start", ""), stop_raw, stop, body))
+                el.clear()
+    except ET.ParseError as e:
+        logger.error("XMLTV parse error in %s: %s", path, e)
+    return channels, icons, programmes
+
+
+async def _rebuild_from_cache():
+    global _epg_channels, _channel_icons, _programmes, _version
+    channels, icons, programmes = {}, {}, []
+    for src in EPG_SOURCES:
+        if not src.get("enabled", True):
+            continue
+        f = _cache_file(src["name"])
+        if not f.exists():
+            continue
+        c, i, p = await asyncio.to_thread(_parse_file, f)
+        channels.update(c)
+        icons.update(i)
+        programmes.extend(p)
+        logger.info("EPG %s: %d channels, %d programmes", src["name"], len(c), len(p))
+    _epg_channels, _channel_icons, _programmes = channels, icons, programmes
+    _version += 1
+    _xml_cache.clear()
+
+
+async def load_cache():
+    """Startup: use what is on disk, no network needed."""
     async with _fetch_lock:
-        if not EPG_SOURCES:
-            logger.info("No EPG sources configured")
-            _epg_data = []
-            _last_fetch = None
-            return
+        await _rebuild_from_cache()
 
-        all_events = []
-        async with httpx.AsyncClient(timeout=30) as client:
+
+async def fetch_all():
+    global _last_fetch
+    async with _fetch_lock:
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
             for src in EPG_SOURCES:
-                if not src.get("enabled"):
+                if not src.get("enabled", True):
                     continue
                 try:
                     resp = await client.get(src["url"])
                     resp.raise_for_status()
-                    text = _decode_response(resp, src["url"])
-                    cache_file = EPG_CACHE_DIR / f"{src['name']}.xml"
-                    cache_file.write_text(text)
-                    events = _parse_xmltv(text)
-                    all_events.extend(events)
-                    logger.info("Fetched %d events from %s", len(events), src["name"])
+                    data = await asyncio.to_thread(_maybe_gunzip, resp.content)
+                    target = _cache_file(src["name"])
+                    tmp = target.with_suffix(".tmp")
+                    await asyncio.to_thread(tmp.write_bytes, data)
+                    tmp.replace(target)
                 except Exception as e:
-                    logger.warning("Failed to fetch EPG from %s: %s", src["name"], e)
-                    cache_file = EPG_CACHE_DIR / f"{src['name']}.xml"
-                    if cache_file.exists():
-                        text = cache_file.read_text(encoding="utf-8")
-                        events = _parse_xmltv(text)
-                        all_events.extend(events)
-                        logger.info("Loaded %d events from cache for %s", len(events), src["name"])
-
-        _epg_data = all_events
+                    logger.warning("Failed to fetch EPG from %s: %s (using cache if present)", src["name"], e)
+        await _rebuild_from_cache()
         _last_fetch = datetime.now()
 
 
-def _decode_response(resp: httpx.Response, url: str) -> str:
-    ct = resp.headers.get("content-type", "")
-    if "gzip" in ct or url.endswith(".gz"):
-        return gzip.decompress(resp.content).decode("utf-8", errors="replace")
-    return resp.text
-
-
-_channel_icons: dict[str, str] = {}
-_epg_channels: dict[str, str] = {}
-
+# ---------------------------------------------------------------- queries
 
 def get_channel_icons() -> dict[str, str]:
     return dict(_channel_icons)
@@ -96,76 +176,77 @@ def get_epg_channels() -> list[dict]:
     return [{"id": k, "name": v} for k, v in _epg_channels.items()]
 
 
-def _parse_xmltv(xml: str) -> list[dict]:
-    global _channel_icons, _epg_channels
-    events = []
-    import xml.etree.ElementTree as ET
-    try:
-        root = ET.fromstring(xml.encode("utf-8") if isinstance(xml, str) else xml)
-        for channel_el in root.findall("channel"):
-            ch_id = channel_el.get("id", "")
-            dn_el = channel_el.find("display-name")
-            dn = dn_el.text if dn_el is not None and dn_el.text else ch_id
-            _epg_channels[ch_id] = dn
-            icon_el = channel_el.find("icon")
-            if icon_el is not None and icon_el.get("src"):
-                _channel_icons[ch_id] = icon_el.get("src")
-
-        for programme in root.findall("programme"):
-            ch = programme.get("channel", "")
-            start_str = programme.get("start", "")
-            stop_str = programme.get("stop", "")
-            title_el = programme.find("title")
-            title = title_el.text if title_el is not None else ""
-            desc_el = programme.find("desc")
-            desc = desc_el.text.strip() if desc_el is not None and desc_el.text else ""
-            icon_el = programme.find("icon")
-            icon_src = icon_el.get("src", "") if icon_el is not None else ""
-            events.append({
-                "channel": ch,
-                "start": start_str,
-                "stop": stop_str,
-                "title": title,
-                "description": desc,
-                "icon": icon_src,
-            })
-    except ET.ParseError as e:
-        logger.error("XML parse error: %s", e)
-    return events
+def programme_count() -> int:
+    return len(_programmes)
 
 
-def get_epg_data() -> list[dict]:
-    return _epg_data
+def _norm(name: str) -> str:
+    n = name.lower().strip()
+    n = n.replace("ü", "ue").replace("ö", "oe").replace("ä", "ae").replace("ß", "ss")
+    n = re.sub(r"\.[a-z]{2}$", "", n)            # "daserste.de" -> "daserste"
+    n = re.sub(r"[^a-z0-9]+", "", n)
+    n = re.sub(r"(hd|sd|uhd)$", "", n)
+    return n
 
 
-def generate_xmltv(channel_map: dict[str, str]) -> str:
-    lines = [
-        '<?xml version="1.0" encoding="UTF-8"?>',
-        "<tv>",
-    ]
-
-    seen = set()
-    for ev in _epg_data:
-        ch_id = ev["channel"]
-        display_name = channel_map.get(ch_id, ch_id)
-        if ch_id not in seen:
-            lines.append(f'  <channel id="{ch_id}">')
-            lines.append(f'    <display-name>{display_name}</display-name>')
-            lines.append("  </channel>")
-            seen.add(ch_id)
-
-    for ev in _epg_data:
-        ch_id = ev["channel"]
-        display_name = channel_map.get(ch_id, ch_id)
-        lines.append(f'  <programme channel="{ch_id}" start="{ev["start"]}" stop="{ev["stop"]}">')
-        lines.append(f'    <title>{_escape(ev["title"])}</title>')
-        if ev.get("description"):
-            lines.append(f'    <desc>{_escape(ev["description"])}</desc>')
-        lines.append("  </programme>")
-
-    lines.append("</tv>")
-    return "\n".join(lines) + "\n"
+def _name_index() -> dict[str, str]:
+    by_name: dict[str, str] = {}
+    for ch_id, dn in _epg_channels.items():
+        by_name.setdefault(_norm(dn), ch_id)
+        by_name.setdefault(_norm(ch_id), ch_id)
+    return by_name
 
 
-def _escape(text: str) -> str:
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+def resolve_epg_id(tvg_id: str, names: list[str], by_name: Optional[dict] = None) -> Optional[str]:
+    """Manual mapping (tvg-id is an EPG id) wins, otherwise match by channel name."""
+    if tvg_id in _epg_channels:
+        return tvg_id
+    if by_name is None:
+        by_name = _name_index()
+    for n in names:
+        key = _norm(n)
+        if key and key in by_name:
+            return by_name[key]
+    return None
+
+
+def generate_xmltv(channels) -> bytes:
+    """channels: iterable of models.Channel. Output uses the playlist's tvg-ids,
+    so players match EPG and channels without manual mapping."""
+    channels = list(channels)
+    now_bucket = datetime.now(timezone.utc).strftime("%Y%m%d%H")
+    sig = hashlib.sha1(json.dumps(
+        [_version, now_bucket] + [[c.tvg_id, c.tvg_name, c.title] for c in channels]
+    ).encode()).hexdigest()
+    if sig in _xml_cache:
+        return _xml_cache[sig]
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=EPG_KEEP_PAST_HOURS)
+    targets: dict[str, list[str]] = {}          # epg id -> output channel ids
+    out = [b'<?xml version="1.0" encoding="UTF-8"?>\n<tv generator-info-name="FritzMux">\n']
+    seen_out = set()
+    by_name = _name_index()
+    for ch in channels:
+        epg_id = resolve_epg_id(ch.tvg_id, [ch.tvg_name, ch.title], by_name)
+        if not epg_id or ch.tvg_id in seen_out:
+            continue
+        seen_out.add(ch.tvg_id)
+        targets.setdefault(epg_id, []).append(ch.tvg_id)
+        out.append(f"  <channel id={quoteattr(ch.tvg_id)}>\n"
+                   f"    <display-name>{escape(ch.tvg_name or ch.title)}</display-name>\n"
+                   f"  </channel>\n".encode("utf-8"))
+
+    for epg_id, start, stop_raw, stop, body in _programmes:
+        outs = targets.get(epg_id)
+        if not outs or (stop is not None and stop < cutoff):
+            continue
+        for out_id in outs:
+            out.append(f"  <programme start={quoteattr(start)} stop={quoteattr(stop_raw)} "
+                       f"channel={quoteattr(out_id)}>".encode("utf-8"))
+            out.append(body)
+            out.append(b"</programme>\n")
+    out.append(b"</tv>\n")
+    result = b"".join(out)
+    _xml_cache.clear()
+    _xml_cache[sig] = result
+    return result

@@ -6,3 +6,8 @@ services:
     volumes:
       - ../fritzmux_data:/app/data
     restart: unless-stopped
+    # environment:
+    #   FRITZMUX_USER: admin            # optional: password for web UI / admin API
+    #   FRITZMUX_PASSWORD: change-me    # (playlist, EPG and streams stay open for players)
+    #   FRITZMUX_MAX_STREAMS: 4
+    #   FRITZMUX_STREAM_TIMEOUT: 15
