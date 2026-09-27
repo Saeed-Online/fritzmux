@@ -98,8 +98,10 @@ async def _drain_stderr(s: _Stream):
         data = await proc.stderr.read(4096)
         if not data:
             break
-        pending += data
+        # ffmpeg ends progress lines with \r; cap the tail so it can never grow unbounded.
+        pending = (pending + data).replace(b"\r", b"\n")
         *lines, pending = pending.split(b"\n")
+        pending = pending[-4096:]
         for raw in lines:
             line = raw.decode("utf-8", errors="replace").strip()
             if not line:
