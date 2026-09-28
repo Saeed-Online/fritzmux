@@ -5,6 +5,7 @@ One ffmpeg process per channel, shared by all viewers of that channel
 continuously so the process can never block on a full pipe.
 """
 import asyncio
+import re
 import logging
 import signal
 import time
@@ -14,6 +15,7 @@ from app.config import (
     DEFAULT_FFMPEG_PATH,
     MAX_STREAMS,
     RTSP_TRANSPORT,
+    STREAM_TRACKS,
     STREAM_TIMEOUT,
     VIEWER_BUFFER_BYTES,
 )
@@ -23,6 +25,9 @@ logger = logging.getLogger(__name__)
 TS_PACKET = 188
 READ_SIZE = TS_PACKET * 348          # ~64 KiB, always whole TS packets
 STDERR_LOG_BURST = 20                # max ffmpeg log lines per 10 s window
+
+
+_NOISE = re.compile(r"non-existing PPS|decode_slice_header error|no frame!|Last message repeated")
 
 
 class NoTunerFree(Exception):
@@ -77,6 +82,16 @@ _streams: dict[str, _Stream] = {}
 _lock = asyncio.Lock()
 
 
+def _track_maps() -> list[str]:
+    if STREAM_TRACKS == "all":
+        # every audio track (Dolby, audio description, ...) plus teletext/subtitles:
+        # fine for VLC/Kodi/TiviMate, but TV players (LG webOS) stall after ~10 s
+        # because they buffer the unused tracks until their queue is full
+        return ["-map", "0:v?", "-map", "0:a?", "-map", "0:s?"]
+    # default: first video + first audio (main German stereo track on DVB-C)
+    return ["-map", "0:v:0?", "-map", "0:a:0?"]
+
+
 def _ffmpeg_args(url: str) -> list[str]:
     args = [DEFAULT_FFMPEG_PATH, "-hide_banner", "-nostdin", "-nostats", "-loglevel", "error"]
     if url.startswith("rtsp://"):
@@ -89,9 +104,7 @@ def _ffmpeg_args(url: str) -> list[str]:
         args += ["-protocol_whitelist", "http,https,tls,tcp,udp,rtp,crypto"]
     args += [
         "-i", url,
-        # Keep every audio track (Dolby, audio description, original language)
-        # and DVB subtitles/teletext instead of ffmpeg's "one video + one audio" default.
-        "-map", "0:v?", "-map", "0:a?", "-map", "0:s?",
+        *_track_maps(),
         "-c", "copy",
         "-f", "mpegts",
         "pipe:1",
@@ -121,6 +134,8 @@ async def _drain_stderr(s: _Stream):
             line = raw.decode("utf-8", errors="replace").strip()
             if not line:
                 continue
+            if _NOISE.search(line):
+                continue  # harmless decoder messages while ffmpeg probes the first frames
             s.last_error = line[-300:]
             now = time.monotonic()
             if now - window_start > 10:
@@ -150,8 +165,8 @@ async def _pump(s: _Stream):
                 continue
             for q in list(s.subscribers):
                 if not q.put(chunk):
-                    logger.warning("Viewer of channel %s is %d MB behind (connection too slow "
-                                   "for this channel?), disconnecting it",
+                    logger.warning("Viewer of channel %s stopped reading (%d MB behind: player "
+                                   "stalled, idle probe connection or slow network), disconnecting it",
                                    s.channel_id, q.backlog // 1_000_000)
                     s.subscribers.discard(q)
                     _push_eof(q)

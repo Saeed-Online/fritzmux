@@ -26,6 +26,9 @@ MAX_STREAMS = _int_env("FRITZMUX_MAX_STREAMS", 4)
 # (makes player reconnects and "back to the previous channel" instant).
 # An idle stream is stopped immediately if its tuner is needed for another channel.
 STREAM_TIMEOUT = _int_env("FRITZMUX_STREAM_TIMEOUT", 15)
+# Tracks sent to players: "main" = first video + first audio (works on TVs),
+# "all" = every audio track + teletext/subtitles (VLC, Kodi, TiviMate).
+STREAM_TRACKS = os.environ.get("FRITZMUX_TRACKS", "main").strip().lower()
 # Per-viewer buffer before a viewer that cannot keep up is disconnected
 # (64 MB is roughly 40-60 s of an HD channel).
 VIEWER_BUFFER_BYTES = _int_env("FRITZMUX_VIEWER_BUFFER_MB", 64) * 1024 * 1024
