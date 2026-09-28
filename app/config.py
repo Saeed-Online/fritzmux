@@ -26,6 +26,9 @@ MAX_STREAMS = _int_env("FRITZMUX_MAX_STREAMS", 4)
 # (makes player reconnects and "back to the previous channel" instant).
 # An idle stream is stopped immediately if its tuner is needed for another channel.
 STREAM_TIMEOUT = _int_env("FRITZMUX_STREAM_TIMEOUT", 15)
+# Per-viewer buffer before a viewer that cannot keep up is disconnected
+# (64 MB is roughly 40-60 s of an HD channel).
+VIEWER_BUFFER_BYTES = _int_env("FRITZMUX_VIEWER_BUFFER_MB", 64) * 1024 * 1024
 # Seconds to wait for the first video data from ffmpeg.
 STREAM_START_TIMEOUT = _int_env("FRITZMUX_STREAM_START_TIMEOUT", 10)
 

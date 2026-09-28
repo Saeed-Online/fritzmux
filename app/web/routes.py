@@ -1,5 +1,6 @@
 import logging
 import re
+from urllib.parse import urlparse
 from pathlib import Path
 
 import httpx
@@ -7,7 +8,7 @@ from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
-from app import epg_manager, m3u_handler, stream_manager
+from app import epg_manager, m3u_handler, matching, stream_manager
 from app.config import MAX_STREAMS, STREAM_START_TIMEOUT
 from app.models import ChannelUpdate, ImportRequest, ServerStatus
 
@@ -171,7 +172,12 @@ async def api_import_upload(file: UploadFile = File(...), replace: bool = Form(F
 
 
 @router.post("/api/epg/source")
-async def api_epg_add_source(name: str = Form(...), url: str = Form(...)):
+async def api_epg_add_source(request: Request, name: str = Form(...), url: str = Form(...)):
+    parsed = urlparse(url.strip())
+    if parsed.path.rstrip("/").endswith("/api/epg.xml") and parsed.port in (None, request.url.port):
+        return err("Das ist die eigene EPG-Ausgabe von FritzMux, keine Quelle. "
+                   "Hier gehört eine externe XMLTV-Datei hin, z.B. "
+                   "https://epgshare01.online/epgshare01/epg_ripper_DE1.xml.gz")
     try:
         epg_manager.add_source(name, url)
     except epg_manager.SourceError as e:
@@ -269,16 +275,6 @@ async def api_logo_upload(channel_id: str, file: UploadFile = File(...)):
     return {"status": "ok", "logo": f"/api/logo/{channel_id}"}
 
 
-def _normalize_logo_name(name: str) -> str:
-    n = name.lower().strip()
-    n = n.replace("ü", "ue").replace("ö", "oe").replace("ä", "ae").replace("ß", "ss")
-    n = re.sub(r"[^a-z0-9]+", "_", n).strip("_")
-    for suffix in ("_hd", "_sd", "_de"):
-        if n.endswith(suffix):
-            n = n[:-len(suffix)]
-    return n
-
-
 @router.post("/api/logos/avm")
 async def api_fetch_avm_logos():
     try:
@@ -292,40 +288,38 @@ async def api_fetch_avm_logos():
     if not avm_logos:
         return err("Keine Logos im AVM-Repository gefunden", 404)
 
-    logo_map = {}
+    # compact name -> {"sd": file, "hd": file}
+    variants: dict[str, dict[str, str]] = {}
     for fn in avm_logos:
         base = fn[:-4]
-        logo_map.setdefault(base, fn)
-        for suffix in ("_hd", "_sd"):
-            if base.endswith(suffix):
-                logo_map.setdefault(base[:-len(suffix)], fn)
+        kind = "hd" if base.lower().endswith("_hd") else "sd"
+        variants.setdefault(matching.compact(base), {})[kind] = fn
+    index = {k: k for k in variants}
 
     found = 0
     async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
         for ch in m3u_handler.CHANNELS.values():
             cache_file, meta_file = m3u_handler.logo_paths(ch.id)
             if ch.tvg_logo == "__uploaded__" and cache_file.exists():
-                continue  # keep logos the user uploaded or that were already fetched
-            for candidate in (ch.tvg_name, ch.title, ch.tvg_id):
-                if not candidate:
-                    continue
-                norm = _normalize_logo_name(candidate)
-                fn = logo_map.get(norm) or logo_map.get(f"{norm}_hd") or logo_map.get(f"{norm}_sd")
-                if not fn:
-                    continue
-                try:
-                    resp = await client.get(AVM_LOGO_BASE + fn)
-                    resp.raise_for_status()
-                except Exception:
-                    continue
-                cache_file.write_bytes(resp.content)
-                meta_file.write_text(resp.headers.get("content-type", "image/png").split(";")[0])
-                ch.tvg_logo = "__uploaded__"
-                found += 1
-                break
+                found += 1  # uploaded or fetched earlier
+                continue
+            names = [ch.tvg_name, ch.title]
+            key = matching.best_match(names, index, matching.LOGO_ALIASES)
+            if not key:
+                continue
+            v = variants[key]
+            fn = (v.get("hd") or v.get("sd")) if matching.wants_hd(names) else (v.get("sd") or v.get("hd"))
+            try:
+                resp = await client.get(AVM_LOGO_BASE + fn)
+                resp.raise_for_status()
+            except Exception:
+                continue
+            cache_file.write_bytes(resp.content)
+            meta_file.write_text(resp.headers.get("content-type", "image/png").split(";")[0])
+            ch.tvg_logo = "__uploaded__"
+            found += 1
 
-    if found:
-        m3u_handler.save_channels()
+    m3u_handler.save_channels()
     return {"status": "ok", "found": found, "total": len(m3u_handler.CHANNELS)}
 
 

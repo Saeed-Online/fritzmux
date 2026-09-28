@@ -15,13 +15,13 @@ from app.config import (
     MAX_STREAMS,
     RTSP_TRANSPORT,
     STREAM_TIMEOUT,
+    VIEWER_BUFFER_BYTES,
 )
 
 logger = logging.getLogger(__name__)
 
 TS_PACKET = 188
 READ_SIZE = TS_PACKET * 348          # ~64 KiB, always whole TS packets
-QUEUE_MAX = 256                      # ~16 MiB backlog per viewer before it is dropped
 STDERR_LOG_BURST = 20                # max ffmpeg log lines per 10 s window
 
 
@@ -29,12 +29,35 @@ class NoTunerFree(Exception):
     """All tuners are busy with channels that have viewers."""
 
 
+class Viewer:
+    """Per-viewer buffer, limited by bytes (ffmpeg writes many small chunks,
+    so a chunk-count limit was only ~1-5 s of HD video)."""
+
+    def __init__(self):
+        self._q: asyncio.Queue = asyncio.Queue()
+        self.backlog = 0
+
+    def put(self, chunk: Optional[bytes]) -> bool:
+        if chunk is not None:
+            if self.backlog + len(chunk) > VIEWER_BUFFER_BYTES:
+                return False
+            self.backlog += len(chunk)
+        self._q.put_nowait(chunk)
+        return True
+
+    async def get(self) -> Optional[bytes]:
+        chunk = await self._q.get()
+        if chunk is not None:
+            self.backlog -= len(chunk)
+        return chunk
+
+
 class _Stream:
     def __init__(self, channel_id: str, url: str):
         self.channel_id = channel_id
         self.url = url
         self.process: Optional[asyncio.subprocess.Process] = None
-        self.subscribers: set[asyncio.Queue] = set()
+        self.subscribers: set[Viewer] = set()
         self.idle_since: Optional[float] = None
         self.stop_timer: Optional[asyncio.TimerHandle] = None
         self.last_error = ""
@@ -55,7 +78,7 @@ _lock = asyncio.Lock()
 
 
 def _ffmpeg_args(url: str) -> list[str]:
-    args = [DEFAULT_FFMPEG_PATH, "-hide_banner", "-nostdin", "-nostats", "-loglevel", "warning"]
+    args = [DEFAULT_FFMPEG_PATH, "-hide_banner", "-nostdin", "-nostats", "-loglevel", "error"]
     if url.startswith("rtsp://"):
         args += [
             "-rtsp_transport", RTSP_TRANSPORT,
@@ -76,16 +99,8 @@ def _ffmpeg_args(url: str) -> list[str]:
     return args
 
 
-def _push_eof(q: asyncio.Queue):
-    while True:
-        try:
-            q.put_nowait(None)
-            return
-        except asyncio.QueueFull:
-            try:
-                q.get_nowait()
-            except asyncio.QueueEmpty:
-                pass
+def _push_eof(q: Viewer):
+    q.put(None)
 
 
 async def _drain_stderr(s: _Stream):
@@ -134,12 +149,14 @@ async def _pump(s: _Stream):
             if not chunk:
                 continue
             for q in list(s.subscribers):
-                try:
-                    q.put_nowait(chunk)
-                except asyncio.QueueFull:
-                    logger.warning("Viewer of channel %s too slow, disconnecting it", s.channel_id)
+                if not q.put(chunk):
+                    logger.warning("Viewer of channel %s is %d MB behind (connection too slow "
+                                   "for this channel?), disconnecting it",
+                                   s.channel_id, q.backlog // 1_000_000)
                     s.subscribers.discard(q)
                     _push_eof(q)
+                    if not s.subscribers:
+                        unsubscribe(s, q)
     except Exception:
         logger.exception("Relay error for channel %s", s.channel_id)
     finally:
@@ -184,7 +201,7 @@ async def _terminate(s: _Stream):
     await asyncio.gather(*s.tasks, return_exceptions=True)
 
 
-async def subscribe(channel_id: str, url: str) -> tuple[_Stream, asyncio.Queue]:
+async def subscribe(channel_id: str, url: str) -> tuple[_Stream, Viewer]:
     async with _lock:
         s = _streams.get(channel_id)
         if s and (not s.alive or s.url != url):
@@ -199,7 +216,7 @@ async def subscribe(channel_id: str, url: str) -> tuple[_Stream, asyncio.Queue]:
                 # Free the tuner that has been idle the longest (channel zapping).
                 await _terminate(min(idle, key=lambda x: x.idle_since or 0))
             s = await _start(channel_id, url)
-        q: asyncio.Queue = asyncio.Queue(maxsize=QUEUE_MAX)
+        q = Viewer()
         s.subscribers.add(q)
         s.idle_since = None
         if s.stop_timer:
@@ -208,7 +225,7 @@ async def subscribe(channel_id: str, url: str) -> tuple[_Stream, asyncio.Queue]:
         return s, q
 
 
-def unsubscribe(s: _Stream, q: asyncio.Queue):
+def unsubscribe(s: _Stream, q: Viewer):
     """Synchronous on purpose: safe to call from a cancelled generator's finally."""
     s.subscribers.discard(q)
     if s.subscribers or not s.alive:
@@ -225,7 +242,7 @@ def unsubscribe(s: _Stream, q: asyncio.Queue):
     s.stop_timer = loop.call_later(STREAM_TIMEOUT, _expire)
 
 
-async def first_chunk(q: asyncio.Queue, timeout: float) -> Optional[bytes]:
+async def first_chunk(q: Viewer, timeout: float) -> Optional[bytes]:
     try:
         return await asyncio.wait_for(q.get(), timeout=timeout)
     except asyncio.TimeoutError:

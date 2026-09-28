@@ -13,6 +13,7 @@ import httpx
 
 from app.config import EPG_CACHE_DIR, EPG_KEEP_PAST_HOURS, EPG_SOURCES_FILE
 from app.m3u_handler import _atomic_write
+from app.matching import EPG_ALIASES, best_match, compact
 
 logger = logging.getLogger(__name__)
 
@@ -180,20 +181,12 @@ def programme_count() -> int:
     return len(_programmes)
 
 
-def _norm(name: str) -> str:
-    n = name.lower().strip()
-    n = n.replace("ü", "ue").replace("ö", "oe").replace("ä", "ae").replace("ß", "ss")
-    n = re.sub(r"\.[a-z]{2}$", "", n)            # "daserste.de" -> "daserste"
-    n = re.sub(r"[^a-z0-9]+", "", n)
-    n = re.sub(r"(hd|sd|uhd)$", "", n)
-    return n
-
-
 def _name_index() -> dict[str, str]:
     by_name: dict[str, str] = {}
     for ch_id, dn in _epg_channels.items():
-        by_name.setdefault(_norm(dn), ch_id)
-        by_name.setdefault(_norm(ch_id), ch_id)
+        by_name.setdefault(compact(ch_id), ch_id)
+        by_name.setdefault(compact(dn), ch_id)
+    by_name.pop("", None)
     return by_name
 
 
@@ -203,11 +196,7 @@ def resolve_epg_id(tvg_id: str, names: list[str], by_name: Optional[dict] = None
         return tvg_id
     if by_name is None:
         by_name = _name_index()
-    for n in names:
-        key = _norm(n)
-        if key and key in by_name:
-            return by_name[key]
-    return None
+    return best_match(names, by_name, EPG_ALIASES)
 
 
 def generate_xmltv(channels) -> bytes:
