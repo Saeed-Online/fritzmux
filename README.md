@@ -30,6 +30,9 @@ docker compose up -d
 ## IPTV Player Einrichtung
 
 1. **Playlist:** `http://<fritzmux-ip>:8181/api/channels.m3u`
+   - Zeigt ein Player kein Bild (iPhone/Apple TV, viele Handy-Apps): HLS-Variante
+     `http://<fritzmux-ip>:8181/api/channels.m3u?format=hls` – Video unverändert, Ton als AAC,
+     ca. 5 s Startzeit. Nutzt denselben Tuner wie der normale Stream.
 2. **EPG:** `http://<fritzmux-ip>:8181/api/epg.xml`
 
 ## Web UI

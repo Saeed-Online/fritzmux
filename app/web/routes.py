@@ -8,7 +8,7 @@ from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
-from app import epg_manager, m3u_handler, matching, stream_manager
+from app import epg_manager, hls_manager, m3u_handler, matching, stream_manager
 from app.config import MAX_STREAMS, STREAM_START_TIMEOUT
 from app.models import ChannelUpdate, ImportRequest, ServerStatus
 
@@ -59,9 +59,9 @@ async def api_channels():
 
 
 @router.get("/api/channels.m3u")
-async def api_m3u(request: Request):
+async def api_m3u(request: Request, format: str = "ts"):
     base_url = str(request.base_url).rstrip("/")
-    content = m3u_handler.generate_m3u(base_url, epg_url=f"{base_url}/api/epg.xml")
+    content = m3u_handler.generate_m3u(base_url, epg_url=f"{base_url}/api/epg.xml", hls=(format == "hls"))
     return Response(
         content=content.encode("utf-8"),
         media_type="audio/x-mpegurl; charset=utf-8",
@@ -365,6 +365,30 @@ async def stream_channel(channel_id: str):
         media_type="video/mp2t",
         headers={"Cache-Control": "no-cache"},
     )
+
+
+@router.get("/hls/{channel_id}/index.m3u8")
+async def hls_playlist(channel_id: str):
+    ch = m3u_handler.CHANNELS.get(channel_id)
+    if not ch:
+        return Response(status_code=404, content="Channel not found")
+    try:
+        text, error = await hls_manager.get_playlist(channel_id, ch.rtsp_url)
+    except stream_manager.NoTunerFree:
+        return Response(status_code=503, content="All tuners busy")
+    if text is None:
+        logger.warning("HLS for channel %s failed: %s", channel_id, error)
+        return Response(status_code=502, content=f"Stream failed: {error}")
+    return Response(content=text, media_type="application/vnd.apple.mpegurl",
+                    headers={"Cache-Control": "no-cache"})
+
+
+@router.get("/hls/{channel_id}/{segment}")
+async def hls_segment(channel_id: str, segment: str):
+    path = hls_manager.segment_path(channel_id, segment)
+    if path is None:
+        return Response(status_code=404)
+    return Response(content=path.read_bytes(), media_type="video/mp2t")
 
 
 @router.post("/api/stream/test")

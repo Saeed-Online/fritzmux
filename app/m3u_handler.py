@@ -215,7 +215,7 @@ def _attr(value: str) -> str:
     return value.replace('"', "'").replace("\n", " ").replace("\r", " ")
 
 
-def generate_m3u(base_url: str = "http://localhost:8181", epg_url: str = "") -> str:
+def generate_m3u(base_url: str = "http://localhost:8181", epg_url: str = "", hls: bool = False) -> str:
     header = "#EXTM3U"
     if epg_url:
         header += f' url-tvg="{epg_url}" x-tvg-url="{epg_url}"'
@@ -228,5 +228,5 @@ def generate_m3u(base_url: str = "http://localhost:8181", epg_url: str = "") -> 
             attrs += f' group-title="{_attr(ch.group_title)}"'
         title = ch.title.replace("\n", " ").replace("\r", " ")
         lines.append(f"#EXTINF:-1 {attrs},{title}")
-        lines.append(f"{base_url}/stream/{ch.id}")
+        lines.append(f"{base_url}/hls/{ch.id}/index.m3u8" if hls else f"{base_url}/stream/{ch.id}")
     return "\n".join(lines) + "\n"

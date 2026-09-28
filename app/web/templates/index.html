@@ -177,6 +177,15 @@
       <button class="copy-btn" onclick="copyUrl('m3uUrlDisplay')">Kopieren</button>
     </div>
     <div class="url-display">
+      <span class="label">M3U (HLS):</span>
+      <span id="m3uHlsUrlDisplay">-</span>
+      <button class="copy-btn" onclick="copyUrl('m3uHlsUrlDisplay')">Kopieren</button>
+    </div>
+    <div style="font-size:12px;color:var(--text2);margin:-4px 0 10px;">
+      HLS-Variante für iPhone/Apple TV und Player, die mit dem normalen Stream kein Bild zeigen
+      (Ton wird nach AAC umgewandelt, etwas mehr Verzögerung).
+    </div>
+    <div class="url-display">
       <span class="label">EPG:</span>
       <span id="epgUrlDisplay">-</span>
       <button class="copy-btn" onclick="copyUrl('epgUrlDisplay')">Kopieren</button>
@@ -540,6 +549,7 @@ function updateBatchButtons() {
 function updateUrls() {
   const origin = window.location.origin;
   document.getElementById("m3uUrlDisplay").textContent = origin + "/api/channels.m3u";
+  document.getElementById("m3uHlsUrlDisplay").textContent = origin + "/api/channels.m3u?format=hls";
   document.getElementById("epgUrlDisplay").textContent = origin + "/api/epg.xml";
 }
 

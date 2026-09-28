@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
 
-from app import epg_manager, m3u_handler, stream_manager
+from app import epg_manager, hls_manager, m3u_handler, stream_manager
 from app.config import AUTH_PASSWORD, AUTH_USER, EPG_FETCH_INTERVAL
 from app.web.routes import router
 
@@ -49,13 +49,14 @@ async def lifespan(app: FastAPI):
     finally:
         shutdown.set()
         epg_task.cancel()
+        await hls_manager.stop_all()
         await stream_manager.stop_all()
 
 
 app = FastAPI(title="FritzMux", version="1.1.0", lifespan=lifespan)
 
 # Paths IPTV players need; they never get credentials.
-_PUBLIC_PREFIXES = ("/api/channels.m3u", "/api/epg.xml", "/api/logo/", "/stream/", "/api/status")
+_PUBLIC_PREFIXES = ("/api/channels.m3u", "/api/epg.xml", "/api/logo/", "/stream/", "/hls/", "/api/status")
 
 
 @app.middleware("http")
