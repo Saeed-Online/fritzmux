@@ -239,3 +239,30 @@ def generate_xmltv(channels) -> bytes:
     _xml_cache.clear()
     _xml_cache[sig] = result
     return result
+
+
+def listings(tvg_id: str, names: list[str], limit: int = 4) -> list[dict]:
+    """Current and upcoming programmes for one channel (for the Xtream API)."""
+    epg_id = resolve_epg_id(tvg_id, names)
+    if not epg_id:
+        return []
+    now = datetime.now(timezone.utc)
+    items = []
+    for ch_id, start_raw, stop_raw, stop, body in _programmes:
+        if ch_id != epg_id or stop is None or stop < now:
+            continue
+        start = _parse_time(start_raw)
+        if start is None:
+            continue
+        try:
+            el = ET.fromstring(b"<p>" + body + b"</p>")
+        except ET.ParseError:
+            continue
+        items.append({
+            "start": start,
+            "stop": stop,
+            "title": (el.findtext("title") or "").strip(),
+            "desc": (el.findtext("desc") or "").strip(),
+        })
+    items.sort(key=lambda x: x["start"])
+    return items[:limit]

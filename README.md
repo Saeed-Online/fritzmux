@@ -35,6 +35,20 @@ docker compose up -d
      ca. 5 s Startzeit. Nutzt denselben Tuner wie der normale Stream.
 2. **EPG:** `http://<fritzmux-ip>:8181/api/epg.xml`
 
+### Xtream-Codes-Login (IPTV Smarters Pro auf LG/Samsung u.a.)
+
+Apps, die nur einen Xtream-Login anbieten:
+
+| Feld       | Wert                              |
+| ---------- | --------------------------------- |
+| Name       | beliebig                          |
+| Username   | beliebig (oder `FRITZMUX_XTREAM_USER`)     |
+| Password   | beliebig (oder `FRITZMUX_XTREAM_PASSWORD`) |
+| URL        | `http://<fritzmux-ip>:8181`       |
+
+Unterstützt: `player_api.php` (Login, Live-Kategorien, Live-Sender, Kurz-EPG), `get.php`, `xmltv.php`,
+Streams unter `/live/<user>/<pass>/<id>.ts` bzw. `.m3u8` (HLS mit AAC-Ton). Kein VOD/Serien.
+
 ## Web UI
 
 ### M3U Import

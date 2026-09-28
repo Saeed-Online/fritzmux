@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import re
 import logging
 import secrets
 from contextlib import asynccontextmanager
@@ -10,6 +11,7 @@ from fastapi.responses import Response
 from app import epg_manager, hls_manager, m3u_handler, stream_manager
 from app.config import AUTH_PASSWORD, AUTH_USER, EPG_FETCH_INTERVAL
 from app.web.routes import router
+from app.web.xtream import router as xtream_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,12 +58,19 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="FritzMux", version="1.1.0", lifespan=lifespan)
 
 # Paths IPTV players need; they never get credentials.
-_PUBLIC_PREFIXES = ("/api/channels.m3u", "/api/epg.xml", "/api/logo/", "/stream/", "/hls/", "/api/status")
+_PUBLIC_PREFIXES = ("/api/channels.m3u", "/api/epg.xml", "/api/logo/", "/stream/", "/hls/", "/api/status",
+                    # Xtream Codes API: checks its own username/password
+                    "/player_api.php", "/get.php", "/xmltv.php", "/live/")
+_XTREAM_SHORT_STREAM = re.compile(r"^/[^/]+/[^/]+/\d+(\.\w+)?$")
 
 
 @app.middleware("http")
 async def basic_auth(request: Request, call_next):
-    public = request.method in ("GET", "HEAD") and request.url.path.startswith(_PUBLIC_PREFIXES)
+    path = request.url.path
+    public = request.method in ("GET", "HEAD") and (
+        path.startswith(_PUBLIC_PREFIXES)
+        or (not path.startswith("/api/") and bool(_XTREAM_SHORT_STREAM.match(path)))
+    ) or path == "/player_api.php"
     if not (AUTH_USER and AUTH_PASSWORD) or public:
         return await call_next(request)
     header = request.headers.get("authorization", "")
@@ -76,3 +85,4 @@ async def basic_auth(request: Request, call_next):
 
 
 app.include_router(router)
+app.include_router(xtream_router)  # last: contains a /{user}/{pass}/{stream} catch-all

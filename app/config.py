@@ -41,6 +41,11 @@ EPG_KEEP_PAST_HOURS = _int_env("FRITZMUX_EPG_KEEP_PAST_HOURS", 6)
 AUTH_USER = os.environ.get("FRITZMUX_USER", "")
 AUTH_PASSWORD = os.environ.get("FRITZMUX_PASSWORD", "")
 
+# Xtream Codes login (IPTV Smarters etc.). Empty = any username/password is accepted
+# (defaults to FRITZMUX_USER/FRITZMUX_PASSWORD when those are set).
+XTREAM_USER = os.environ.get("FRITZMUX_XTREAM_USER", AUTH_USER)
+XTREAM_PASSWORD = os.environ.get("FRITZMUX_XTREAM_PASSWORD", AUTH_PASSWORD)
+
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 EPG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 LOGO_DIR.mkdir(parents=True, exist_ok=True)
