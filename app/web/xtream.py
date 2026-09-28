@@ -55,7 +55,7 @@ def _login_info(request: Request, username: str, password: str) -> dict:
             "message": "FritzMux",
             "auth": 1,
             "status": "Active",
-            "exp_date": None,
+            "exp_date": "4102444800",   # 2100-01-01: some apps reject null
             "is_trial": "0",
             "active_cons": "0",
             "created_at": str(_STARTED),
@@ -127,9 +127,28 @@ def _short_epg(stream_id: str, limit: int) -> dict:
     return {"epg_listings": listings}
 
 
+async def _params(request: Request) -> dict:
+    """Xtream clients send the login either in the query string (GET) or as a
+    form body (POST, e.g. newer IPTV Smarters versions)."""
+    params = dict(request.query_params)
+    if request.method == "POST":
+        try:
+            form = await request.form()
+            params.update({k: v for k, v in form.items() if isinstance(v, str)})
+        except Exception:
+            pass
+    return params
+
+
 @router.api_route("/player_api.php", methods=["GET", "POST"])
-async def player_api(request: Request, username: str = "", password: str = "",
-                     action: str = "", category_id: str = "", stream_id: str = "", limit: int = 4):
+async def player_api(request: Request):
+    p = await _params(request)
+    username, password = p.get("username", ""), p.get("password", "")
+    action, category_id, stream_id = p.get("action", ""), p.get("category_id", ""), p.get("stream_id", "")
+    try:
+        limit = int(p.get("limit", 4))
+    except ValueError:
+        limit = 4
     if not _authorized(username, password):
         return JSONResponse({"user_info": {"auth": 0}})
     if not action:
@@ -146,8 +165,10 @@ async def player_api(request: Request, username: str = "", password: str = "",
     return JSONResponse({"error": f"unsupported action {action}"}, status_code=400)
 
 
-@router.get("/get.php")
-async def get_playlist(request: Request, username: str = "", password: str = "", output: str = "ts"):
+@router.api_route("/get.php", methods=["GET", "POST"])
+async def get_playlist(request: Request):
+    p = await _params(request)
+    username, password, output = p.get("username", ""), p.get("password", ""), p.get("output", "ts")
     if not _authorized(username, password):
         return Response(status_code=401)
     base = _base(request)
@@ -155,9 +176,10 @@ async def get_playlist(request: Request, username: str = "", password: str = "",
     return Response(content=content.encode("utf-8"), media_type="audio/x-mpegurl; charset=utf-8")
 
 
-@router.get("/xmltv.php")
-async def xmltv(username: str = "", password: str = ""):
-    if not _authorized(username, password):
+@router.api_route("/xmltv.php", methods=["GET", "POST"])
+async def xmltv(request: Request):
+    p = await _params(request)
+    if not _authorized(p.get("username", ""), p.get("password", "")):
         return Response(status_code=401)
     return await routes.api_epg()
 

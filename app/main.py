@@ -6,6 +6,7 @@ import secrets
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
 from app import epg_manager, hls_manager, m3u_handler, stream_manager
@@ -70,7 +71,7 @@ async def basic_auth(request: Request, call_next):
     public = request.method in ("GET", "HEAD") and (
         path.startswith(_PUBLIC_PREFIXES)
         or (not path.startswith("/api/") and bool(_XTREAM_SHORT_STREAM.match(path)))
-    ) or path == "/player_api.php"
+    ) or path in ("/player_api.php", "/get.php", "/xmltv.php") or request.method == "OPTIONS"
     if not (AUTH_USER and AUTH_PASSWORD) or public:
         return await call_next(request)
     header = request.headers.get("authorization", "")
@@ -84,5 +85,13 @@ async def basic_auth(request: Request, call_next):
     return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="FritzMux"'})
 
 
+# TV apps (LG webOS, Samsung Tizen) are web apps: without CORS headers the
+# browser engine hides the response and the app reports "Authorization failed".
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST", "HEAD", "OPTIONS"],
+    allow_headers=["*"],
+)
 app.include_router(router)
 app.include_router(xtream_router)  # last: contains a /{user}/{pass}/{stream} catch-all
