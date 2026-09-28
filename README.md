@@ -131,6 +131,8 @@ Per Umgebungsvariable (z.B. in `docker-compose.yml` unter `environment:`):
 | `FRITZMUX_STREAM_TIMEOUT`       | 15          | Sekunden, die ein Sender nach dem letzten Zuschauer weiterläuft      |
 | `FRITZMUX_STREAM_START_TIMEOUT` | 10          | Sekunden bis zum ersten Bild, sonst Fehler 502                      |
 | `FRITZMUX_RTSP_TRANSPORT`       | udp         | RTSP-Transport zur Fritzbox (TCP lehnt die Box mit 461 ab)          |
+| `FRITZMUX_TRACKS`               | main        | `main`: erstes Video + erste Tonspur (nötig für LG/webOS-Player, sonst Standbild nach ~10 s). `all`: alle Tonspuren + Videotext/Untertitel (VLC, Kodi, TiviMate) |
+| `FRITZMUX_VIEWER_BUFFER_MB`     | 64          | Puffer pro Zuschauer, bevor ein nicht mehr lesender Player getrennt wird |
 | `FRITZMUX_EPG_INTERVAL`         | 3600        | EPG-Aktualisierung in Sekunden                                      |
 | `FRITZMUX_EPG_KEEP_PAST_HOURS`  | 6           | Wie lange beendete Sendungen im EPG bleiben                         |
 | `FRITZMUX_USER` / `FRITZMUX_PASSWORD` | leer  | Optionaler Passwortschutz (HTTP Basic) für Web UI und Admin-API. Playlist, EPG, Logos und Streams bleiben für Player offen. |
